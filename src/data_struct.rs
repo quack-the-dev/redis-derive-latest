@@ -9,7 +9,7 @@ pub fn derive_to_redis_struct(
 ) -> proc_macro::TokenStream {
     match &data_struct.fields {
         Fields::Named(fields_named) => {
-            let mut regular_fields = Vec::new();
+            let mut regular_fields: Vec<(&syn::Ident, String, bool)> = Vec::new();
 
             for field in &fields_named.named {
                 let field_ident = field.ident.as_ref().expect("Named field should have ident");
@@ -25,29 +25,78 @@ pub fn derive_to_redis_struct(
                     field_attrs.rename.as_ref(),
                 );
 
-                regular_fields.push((field_ident, field_name.clone()));
+                let is_optional = util::is_optional(&field.ty);
+                regular_fields.push((field_ident, field_name.clone(), is_optional));
             }
 
-            let (field_idents, field_names): (Vec<_>, Vec<_>) =
-                regular_fields.into_iter().unzip();
+            let (field_idents, field_names, field_is_optionals): (Vec<_>, Vec<_>, Vec<_>) = {
+                let mut __ids = Vec::new();
+                let mut __names = Vec::new();
+                let mut __opts = Vec::new();
+                for (i, n, o) in regular_fields {
+                    __ids.push(i);
+                    __names.push(n);
+                    __opts.push(o);
+                }
+                (__ids, __names, __opts)
+            };
+
+            // Build per-field tokens to avoid type-mismatch in branches
+            let write_kvs: Vec<proc_macro2::TokenStream> = field_idents
+                .iter()
+                .zip(field_names.iter())
+                .zip(field_is_optionals.iter())
+                .map(|((ident, name), is_opt)| {
+                    if *is_opt {
+                        quote! {
+                            out.write_arg(#name.as_bytes());
+                            match &self.#ident {
+                                Some(__value) => { __value.write_redis_args(out); }
+                                None => { out.write_arg(b"null"); }
+                            }
+                        }
+                    } else {
+                        quote! {
+                            out.write_arg(#name.as_bytes());
+                            (&self.#ident).write_redis_args(out);
+                        }
+                    }
+                })
+                .collect();
+
+            let num_args_tokens: Vec<proc_macro2::TokenStream> = field_idents
+                .iter()
+                .zip(field_names.iter())
+                .zip(field_is_optionals.iter())
+                .map(|((ident, _name), is_opt)| {
+                    if *is_opt {
+                        quote! {
+                            count += 1; // field name
+                            match &self.#ident {
+                                Some(__value) => { count += __value.num_of_args(); }
+                                None => { count += 1; } // the literal "null"
+                            }
+                        }
+                    } else {
+                        quote! {
+                            count += 1; // field name
+                            count += (&self.#ident).num_of_args(); // field value args
+                        }
+                    }
+                })
+                .collect();
 
             // Generate the basic ToRedisArgs implementation
             let to_redis_impl = quote! {
                 impl redis::ToRedisArgs for #type_ident {
                     fn write_redis_args<W: ?Sized + redis::RedisWrite>(&self, out: &mut W) {
                         // Write each field as key-value pairs for hash storage
-                        #(
-                            out.write_arg(#field_names.as_bytes());
-                            (&self.#field_idents).write_redis_args(out);
-                        )*
+                        #(#write_kvs)*
                     }
 
                     fn num_of_args(&self) -> usize {
                         let mut count = 0;
-                        #(
-                            count += 1; // field name
-                            count += (&self.#field_idents).num_of_args(); // field value args
-                        )*
+                        #(#num_args_tokens)*
                         count
                     }
                 }
@@ -105,7 +154,7 @@ pub fn derive_from_redis_struct(
 ) -> proc_macro::TokenStream {
     match &data_struct.fields {
         Fields::Named(fields_named) => {
-            let mut regular_fields = Vec::new();
+            let mut regular_fields: Vec<(&syn::Ident, String, bool)> = Vec::new();
 
             for field in &fields_named.named {
                 let field_ident = field.ident.as_ref().expect("Named field should have ident");
@@ -121,11 +170,76 @@ pub fn derive_from_redis_struct(
                     field_attrs.rename.as_ref(),
                 );
 
-                regular_fields.push((field_ident, field_name));
+                let is_optional = util::is_optional(&field.ty);
+                regular_fields.push((field_ident, field_name, is_optional));
             }
 
-            let (field_idents, field_names): (Vec<_>, Vec<_>) =
-                regular_fields.into_iter().unzip();
+            let (field_idents, field_names, field_is_optionals): (Vec<_>, Vec<_>, Vec<_>) = {
+                let mut __ids = Vec::new();
+                let mut __names = Vec::new();
+                let mut __opts = Vec::new();
+                for (i, n, o) in regular_fields {
+                    __ids.push(i);
+                    __names.push(n);
+                    __opts.push(o);
+                }
+                (__ids, __names, __opts)
+            };
+
+            // Build per-field assignment tokens (avoid mixing Option and non-Option types)
+            let assign_tokens: Vec<proc_macro2::TokenStream> = field_idents
+                .iter()
+                .zip(field_names.iter())
+                .zip(field_is_optionals.iter())
+                .map(|((ident, name), is_opt)| {
+                    if *is_opt {
+                        quote! {
+                            #ident: {
+                                match fields_map.get(#name) {
+                                    Some(value) => {
+                                        let __is_null = match value {
+                                            redis::Value::Nil => true,
+                                            redis::Value::BulkString(data) => data.as_slice() == b"null",
+                                            redis::Value::SimpleString(s) => s == "null",
+                                            redis::Value::VerbatimString { text, .. } => text == "null",
+                                            _ => false,
+                                        };
+                                        if __is_null {
+                                            None
+                                        } else {
+                                            Some(redis::FromRedisValue::from_redis_value(value)
+                                                .map_err(|e| redis::RedisError::from((
+                                                    redis::ErrorKind::TypeError,
+                                                    "Failed to parse field",
+                                                    format!("Field '{}': {}", #name, e),
+                                                )))?)
+                                        }
+                                    }
+                                    None => None,
+                                }
+                            }
+                        }
+                    } else {
+                        quote! {
+                            #ident: {
+                                match fields_map.get(#name) {
+                                    Some(value) => redis::FromRedisValue::from_redis_value(value)
+                                        .map_err(|e| redis::RedisError::from((
+                                            redis::ErrorKind::TypeError,
+                                            "Failed to parse field",
+                                            format!("Field '{}': {}", #name, e),
+                                        )))?,
+                                    None => return Err(redis::RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "Missing required field",
+                                        #name.to_string(),
+                                    ))),
+                                }
+                            }
+                        }
+                    }
+                })
+                .collect();
 
             let from_redis_impl = quote! {
                 impl redis::FromRedisValue for #type_ident {
@@ -140,25 +254,7 @@ pub fn derive_from_redis_struct(
                                     fields_map.insert(key, &chunk[1]);
                                 }
 
-                                Ok(Self {
-                                    #(
-                                        #field_idents: {
-                                            match fields_map.get(#field_names) {
-                                                Some(value) => redis::FromRedisValue::from_redis_value(value)
-                                                    .map_err(|e| redis::RedisError::from((
-                                                        redis::ErrorKind::TypeError,
-                                                        "Failed to parse field",
-                                                        format!("Field '{}': {}", #field_names, e),
-                                                    )))?,
-                                                None => return Err(redis::RedisError::from((
-                                                    redis::ErrorKind::TypeError,
-                                                    "Missing required field",
-                                                    #field_names.to_string(),
-                                                ))),
-                                            }
-                                        },
-                                    )*
-                                })
+                                Ok(Self { #(#assign_tokens),* })
                             }
                             redis::Value::Map(map) => {
                                 // Handle Redis hash/map type (RESP3)
@@ -169,25 +265,7 @@ pub fn derive_from_redis_struct(
                                     fields_map.insert(key_str, value);
                                 }
 
-                                Ok(Self {
-                                    #(
-                                        #field_idents: {
-                                            match fields_map.get(#field_names) {
-                                                Some(value) => redis::FromRedisValue::from_redis_value(value)
-                                                    .map_err(|e| redis::RedisError::from((
-                                                        redis::ErrorKind::TypeError,
-                                                        "Failed to parse field",
-                                                        format!("Field '{}': {}", #field_names, e),
-                                                    )))?,
-                                                None => return Err(redis::RedisError::from((
-                                                    redis::ErrorKind::TypeError,
-                                                    "Missing required field",
-                                                    #field_names.to_string(),
-                                                ))),
-                                            }
-                                        },
-                                    )*
-                                })
+                                Ok(Self { #(#assign_tokens),* })
                             }
                             redis::Value::Nil => {
                                 Err(redis::RedisError::from((

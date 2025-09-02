@@ -16,6 +16,13 @@ pub struct FieldAttributes {
     pub expire_at: Option<String>,
 }
 
+pub fn is_optional(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(syn::TypePath { path, .. }) => path.segments.last().unwrap().ident == "Option",
+        _ => false,
+    }
+}
+
 pub fn parse_attributes(attrs: &[Attribute]) -> ParsedAttributeMap {
     let mut parsed = ParsedAttributeMap::default();
 

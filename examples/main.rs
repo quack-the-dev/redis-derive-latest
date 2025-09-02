@@ -39,19 +39,14 @@ fn main() -> redis::RedisResult<()> {
     let user = User {
         id: 12345,
         username: "john_doe".to_string(),
-        email: Some("john@example.com".to_string()),
+        email: None,
         active: true,
         favorite_color: Color::Blue,
         role: UserRole::Administrator,
     };
 
     // Store the struct as a Redis hash using individual field sets
-    con.hset::<_, _, _, ()>("user:12345", "id", user.id)?;
-    con.hset::<_, _, _, ()>("user:12345", "username", &user.username)?;
-    con.hset::<_, _, _, ()>("user:12345", "email", &user.email)?;
-    con.hset::<_, _, _, ()>("user:12345", "active", user.active)?;
-    con.hset::<_, _, _, ()>("user:12345", "favorite_color", &user.favorite_color)?;
-    con.hset::<_, _, _, ()>("user:12345", "role", &user.role)?;
+    redis::cmd("HSET").arg("user:12345").arg(&user).query::<()>(&mut con)?;
 
 
     // Retrieve the struct from Redis
