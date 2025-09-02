@@ -45,8 +45,8 @@ fn main() -> redis::RedisResult<()> {
         role: UserRole::Administrator,
     };
 
-    // Store the struct as a Redis hash using individual field sets
-    redis::cmd("HSET").arg("user:12345").arg(&user).query::<()>(&mut con)?;
+    // Store the struct as a Redis hash using hset_multiple via derive helper
+    con.hset_multiple::<_, _, _, ()>("user:12345", &user.to_hset_pairs())?;
 
 
     // Retrieve the struct from Redis

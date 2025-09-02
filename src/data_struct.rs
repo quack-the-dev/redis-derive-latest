@@ -102,7 +102,68 @@ pub fn derive_to_redis_struct(
                 }
             };
 
-            to_redis_impl.into()
+            // Build per-field body for to_hset_pairs to avoid type mismatches
+            let to_hset_pairs_body: Vec<proc_macro2::TokenStream> = field_idents
+                .iter()
+                .zip(field_names.iter())
+                .zip(field_is_optionals.iter())
+                .map(|((ident, name), is_opt)| {
+                    if *is_opt {
+                        quote! {
+                            match &self.#ident {
+                                Some(__value) => {
+                                    let __args = redis::ToRedisArgs::to_redis_args(__value);
+                                    if __args.len() == 1 {
+                                        __pairs.push((#name.to_string(), __args.into_iter().next().unwrap()));
+                                    } else {
+                                        let mut __combined: Vec<u8> = Vec::new();
+                                        for __a in __args {
+                                            if !__combined.is_empty() { __combined.push(b' '); }
+                                            __combined.extend_from_slice(&__a);
+                                        }
+                                        __pairs.push((#name.to_string(), __combined));
+                                    }
+                                }
+                                None => {
+                                    __pairs.push((#name.to_string(), b"null".to_vec()));
+                                }
+                            }
+                        }
+                    } else {
+                        quote! {
+                            let __args = redis::ToRedisArgs::to_redis_args(&self.#ident);
+                            if __args.len() == 1 {
+                                __pairs.push((#name.to_string(), __args.into_iter().next().unwrap()));
+                            } else {
+                                let mut __combined: Vec<u8> = Vec::new();
+                                for __a in __args {
+                                    if !__combined.is_empty() { __combined.push(b' '); }
+                                    __combined.extend_from_slice(&__a);
+                                }
+                                __pairs.push((#name.to_string(), __combined));
+                            }
+                        }
+                    }
+                })
+                .collect();
+
+            // Generate inherent method to_hset_pairs for convenient hset_multiple usage
+            let to_hset_pairs_impl = quote! {
+                impl #type_ident {
+                    pub fn to_hset_pairs(&self) -> Vec<(String, Vec<u8>)> {
+                        let mut __pairs: Vec<(String, Vec<u8>)> = Vec::new();
+                        #(#to_hset_pairs_body)*
+                        __pairs
+                    }
+                }
+            };
+
+            let expanded = quote! {
+                #to_redis_impl
+                #to_hset_pairs_impl
+            };
+
+            expanded.into()
         }
         Fields::Unnamed(fields_unnamed) => {
             let field_count = fields_unnamed.unnamed.len();
